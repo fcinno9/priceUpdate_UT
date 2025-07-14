@@ -1,13 +1,30 @@
+// ⚙️ 최적화된 MongoDB 연결 관리 + 크롤링 코드
 import { chromium } from "playwright-core";
 import mongoose from "mongoose";
-import Price from "./models/price.js"; // 확장자 포함 권장 (ESM 기준)
+import Price from "./models/price.js";
 import PlayerReports from "./models/playerReports.js";
-// import data from "./data.json" assert { type: "json" };
-import dbConnect from "./dbConnect.js";
 import playerRestrictions from "./seed/playerRestrictions.json" assert { type: "json" };
-
+import pLimit from "p-limit";
 let browser;
 
+if (process.env.NODE_ENV !== "production") {
+  const dotenv = await import("dotenv");
+  dotenv.config();
+}
+
+const MONGODB_URL = process.env.MONGODB_URL;
+
+// 📌 연결을 사용할 때만 연결하고 자동 해제하는 유틸 함수
+async function withDB(callback) {
+  try {
+    await mongoose.connect(MONGODB_URL, { bufferCommands: false });
+    return await callback();
+  } finally {
+    await mongoose.disconnect();
+  }
+}
+
+// 🔧 브라우저 초기화
 async function initBrowser() {
   if (browser) {
     try {
@@ -38,9 +55,21 @@ async function initBrowser() {
   console.log("✅ Playwright browser initialized");
 }
 
+// 📵 이미지 등 리소스 차단
 async function blockUnwantedResources(page) {
   await page.route("**/*", (route) => {
-    const blockedTypes = new Set(["image", "stylesheet", "font", "media"]);
+    const blockedTypes = new Set([
+      "image",
+      "font",
+      "stylesheet",
+      "media",
+      "texttrack",
+      "fetch",
+      "eventsource",
+      "websocket",
+      "manifest",
+      "other",
+    ]);
     const blockedDomains = ["google-analytics.com", "doubleclick.net"];
     const url = route.request().url();
 
@@ -55,199 +84,181 @@ async function blockUnwantedResources(page) {
   });
 }
 
-async function playerPriceValue(data, Grade) {
-  let context;
-  let grades;
+// 💰 크롤링하여 가격 정보 수집
+async function playerPriceValue(data, Grade, concurrency = 7) {
+  let grades = Array.isArray(Grade) ? [...Grade] : [Grade];
+  const limit = pLimit(concurrency);
+  const results = [];
 
-  if (Array.isArray(Grade)) {
-    grades = [...Grade];
-  } else {
-    grades = [Grade];
-  }
+  await initBrowser();
+  const context = await browser.newContext();
 
-  try {
-    await initBrowser();
-    context = await browser.newContext();
-    const results = [];
+  const tasks = data.map((player) =>
+    limit(async () => {
+      if (playerRestrictions.includes(Number(player.id))) return;
 
-    for (const player of data) {
-      if (playerRestrictions.includes(Number(player.id))) {
-        continue;
-      } else {
+      const { id } = player;
+      const url = `https://fconline.nexon.com/DataCenter/PlayerInfo?spid=${id}&n1Strong=1`;
+
+      const page = await context.newPage();
+      await blockUnwantedResources(page);
+
+      try {
+        console.log(`🌍 Navigating to ${url}`);
+        await page.goto(url, { waitUntil: "domcontentloaded" });
+
+        await page.waitForFunction(
+          () => {
+            const el = document.querySelector(".txt strong");
+            return el && el.getAttribute("title")?.trim() !== "";
+          },
+          { timeout: 5000 }
+        );
+
         for (let grade of grades) {
-          const { id } = player;
-          const url = `https://fconline.nexon.com/DataCenter/PlayerInfo?spid=${id}&n1Strong=${grade}`;
-          const page = await context.newPage();
-          await blockUnwantedResources(page);
-
           try {
-            console.log(`🌍 Navigating to ${url}`);
-            await page.goto(url, { waitUntil: "domcontentloaded" });
+            await page.waitForSelector(".en_selector_wrap .en_wrap", {
+              timeout: 5000,
+            });
+            await page.click(".en_selector_wrap .en_wrap");
+
+            await page.waitForSelector(
+              `.selector_item.en_level${grade}:visible`,
+              { timeout: 5000 }
+            );
+            await page.waitForTimeout(100);
+
+            const elements = await page.$$(`.selector_item.en_level${grade}`);
+            for (const el of elements) {
+              if (await el.isVisible()) {
+                await el.click();
+                break;
+              }
+            }
+
+            await page.waitForTimeout(1200);
 
             await page.waitForFunction(
               () => {
-                const element = document.querySelector(".txt strong");
-                return (
-                  element &&
-                  element.getAttribute("title") &&
-                  element.getAttribute("title").trim() !== ""
-                );
+                const el = document.querySelector(".txt strong");
+                return el && el.textContent.trim() !== "";
               },
-              { timeout: 80000 }
+              { timeout: 5000 }
             );
 
-            let datacenterTitle = await page.evaluate(() => {
-              const element = document.querySelector(".txt strong").textContent;
-              return element;
+            const datacenterTitle = await page.evaluate(() => {
+              const el = document.querySelector(".txt strong");
+              return el ? el.textContent.trim() : null;
             });
 
-            results.push({
-              id: id,
-              prices: { grade, price: datacenterTitle },
-            });
+            if (!datacenterTitle) continue;
 
             console.log(`✔ ID ${id} / Grade ${grade} → ${datacenterTitle}`);
+            results.push({ id, prices: { grade, price: datacenterTitle } });
           } catch (err) {
-            console.error(
-              `❌ Error for ID ${id}, Grade ${grade}:`,
-              err.message
-            );
-            results.push({
-              id: id,
-              prices: { grade, price: "Error" },
-            });
-          } finally {
-            await page.close();
+            console.log(`⛔ ID ${id}, Grade ${grade} → 오류: ${err.message}`);
           }
         }
+      } catch (err) {
+        console.error(`❌ Error for ID ${id}, Grade ${grades}:`, err.message);
+      } finally {
+        await page.close();
       }
-    }
+    })
+  );
 
-    return results;
-  } finally {
-    await context?.close();
-    await browser?.close();
-  }
+  await Promise.all(tasks);
+
+  await context.close();
+  await browser.close();
+
+  return results;
 }
 
+// 📦 DB 저장
 async function saveToDB(results) {
-  const bulkOps = results.map(({ id, prices }) => ({
-    updateOne: {
-      filter: { id: String(id), "prices.grade": prices.grade },
-      update: {
-        $set: { "prices.$[elem].price": prices.price },
+  await withDB(async () => {
+    const bulkOps = results.map(({ id, prices }) => ({
+      updateOne: {
+        filter: { id: String(id), "prices.grade": prices.grade },
+        update: { $set: { "prices.$[elem].price": prices.price } },
+        arrayFilters: [{ "elem.grade": prices.grade }],
+        upsert: true,
       },
-      arrayFilters: [{ "elem.grade": prices.grade }],
-      upsert: true,
-    },
-  }));
+    }));
 
-  if (bulkOps.length > 0) {
-    try {
+    if (bulkOps.length > 0) {
       await Price.bulkWrite(bulkOps);
       console.log("📦 MongoDB updated");
-    } catch (error) {
-      console.error("❌ MongoDB bulkWrite failed:", error.message);
+    } else {
+      console.log("⚠ No data to save");
     }
-  } else {
-    console.log("⚠ No data to save");
-  }
+  });
 }
 
-const playerSearch = async (selectedSeason = "", minOvr = 0) => {
-  let selectedSeasons;
-  if (Array.isArray(selectedSeason)) {
-    selectedSeasons = [...selectedSeason];
-  } else {
-    selectedSeasons = [selectedSeason];
-  }
-  const seasonNumbers = [];
-  const inputplayer = "";
+// 🧠 선수 목록 검색
+async function playerSearch(selectedSeason = "", minOvr = 0) {
+  return await withDB(async () => {
+    let selectedSeasons = Array.isArray(selectedSeason)
+      ? [...selectedSeason]
+      : [selectedSeason];
+    const seasonNumbers = selectedSeasons.map((s) =>
+      Number(String(s).slice(-3))
+    );
 
-  // 이미 배열 형태로 전달된 selectedSeasons과 selectedPositions 사용
+    const inputplayer = "";
+    const queryCondition = [{ name: new RegExp(inputplayer) }];
 
-  for (let season of selectedSeasons) {
-    seasonNumbers.push(Number(String(season).slice(-3)));
-  }
+    if (minOvr && minOvr > 10) {
+      queryCondition.push({
+        "능력치.포지션능력치.최고능력치": { $gte: Number(minOvr) },
+      });
+    }
 
-  let playerReports = [];
+    let playerReports = [];
 
-  const queryCondition = [{ name: new RegExp(inputplayer) }];
+    if (seasonNumbers.length > 0) {
+      for (let sn of seasonNumbers) {
+        const base = sn * 1000000;
+        queryCondition.push({ id: { $gte: base, $lte: base + 999999 } });
 
-  if (minOvr && minOvr > 10) {
-    queryCondition.push({
-      "능력치.포지션능력치.최고능력치": {
-        $gte: Number(minOvr),
-      },
-    });
-  }
+        const found = await PlayerReports.find({ $and: queryCondition })
+          .populate({
+            path: "선수정보",
+            populate: { path: "prices", model: "Price" },
+          })
+          .populate({
+            path: "선수정보.시즌이미지",
+            populate: { path: "시즌이미지", model: "SeasonId" },
+          })
+          .sort({ "능력치.포지션능력치.포지션최고능력치": -1 })
+          .limit(10000);
 
-  if (seasonNumbers && seasonNumbers.length > 0) {
-    for (let seasonNumber of seasonNumbers) {
-      seasonNumber *= 1000000;
-
-      const seasonCondition = {
-        id: {
-          $gte: seasonNumber,
-          $lte: seasonNumber + 999999,
-        },
-      };
-
-      queryCondition.push(seasonCondition);
-
-      let playerReport = await PlayerReports.find({
-        $and: queryCondition,
-      })
+        queryCondition.pop();
+        playerReports = playerReports.concat(found);
+      }
+    } else {
+      const found = await PlayerReports.find({ $and: queryCondition })
         .populate({
           path: "선수정보",
-          populate: {
-            path: "prices", // 중첩된 필드를 처리
-            model: "Price",
-          },
+          populate: { path: "prices", model: "Price" },
         })
         .populate({
           path: "선수정보.시즌이미지",
-          populate: {
-            path: "시즌이미지",
-            model: "SeasonId",
-          },
+          populate: { path: "시즌이미지", model: "SeasonId" },
         })
         .sort({ "능력치.포지션능력치.포지션최고능력치": -1 })
         .limit(10000);
-      queryCondition.pop();
-      playerReports = playerReports.concat(playerReport);
+
+      playerReports = found;
     }
-  } else {
-    let playerReport = await PlayerReports.find({
-      $and: queryCondition,
-    })
-      .populate({
-        path: "선수정보",
-        populate: {
-          path: "prices", // 중첩된 필드를 처리
-          model: "Price",
-        },
-      })
-      .populate({
-        path: "선수정보.시즌이미지",
-        populate: {
-          path: "시즌이미지",
-          model: "SeasonId",
-        },
-      })
-      .sort({ "능력치.포지션능력치.포지션최고능력치": -1 })
-      .limit(10000);
 
-    playerReports = playerReports.concat(playerReport);
-  }
-
-  return playerReports;
-};
+    return playerReports;
+  });
+}
 
 async function main() {
   try {
-    await dbConnect();
-
     // --------------------------------------   2012 KH--------------------------------------
 
     const UT_LIST = await playerSearch([814], 0); // playerSearch(시즌넘버, 최소오버롤)
